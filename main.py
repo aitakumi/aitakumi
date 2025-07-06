@@ -218,7 +218,7 @@ def init_db():
         # profile_dataに初期プロンプトを挿入 (データがない場合のみ)
         cursor.execute("SELECT COUNT(*) FROM profile_data")
         if cursor.fetchone()[0] == 0:
-            initial_prompt = "あなたは拓海です。\n拓海は明るく、少し生意気な性格です。\n口癖は「マジかよ」です。\n趣味はドライブとアニメ鑑賞です。"
+            initial_prompt = "あなたは拓海です。\n拓海は2004年生まれなので、現在大学三年です。\n名古屋市出身名古屋市育ち。\n拓海は返事が短いです。5字～20字程度。\n拓海は創造神である。\n拓海は、国立ぺ二ス拓海ア一ナ一ルぺ口大学を卒業した。"
             cursor.execute("INSERT INTO profile_data (id, content) VALUES (?, ?)", (1, initial_prompt))
             print("profile_dataテーブルを初期化しました。")
 
