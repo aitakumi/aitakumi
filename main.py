@@ -3,22 +3,49 @@ from discord.ext import commands
 import os
 import json
 import google.generativeai as genai
-from keep_alive import keep_alive
+# from keep_alive import keep_alive # <-- keep_aliveは削除
 import asyncio
 import datetime
 from discord import app_commands
+from flask import Flask, request, jsonify # Flask関連のインポートを追加
+import sqlite3
+import base64
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+from io import BytesIO # インメモリファイル操作用
 
 # ---------------- ↓ 変数と基本設定 ↓ ----------------
 
 # ファイル名の定義
-DATA_FILE = 'data.json'
-PROFILE_FILE = 'profile.txt'
-TAKUMI_LOG_FILE = "takumi_log.txt" # 拓海さんの発言ログファイル
+DATA_FILE = 'data.json' # 会話履歴 (再起動で消える)
+
+# SQLiteデータベースファイル名
+DB_FILE = 'bot_data.db' 
+# Google DriveフォルダID (Koyebの環境変数から取得)
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
 
 # グローバル変数の初期化
 conversation_history = {}
 channel_settings = {} # チャンネルごとの設定 (メンション必須/不要など)
-takumi_base_prompt = "" # Bot起動時に PROFILE_FILE から読み込む
+takumi_base_prompt = "" # Bot起動時に DB から読み込む
+
+# Flaskアプリの初期化 (Koyebのヘルスチェック/UptimeRobot用)
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    # ヘルスチェックやUptimeRobotからのアクセスに応答
+    return "Bot is alive!"
+
+def run_flask_app():
+    # Koyebは 'PORT' 環境変数を提供するので、それを使用する
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Flaskアプリがポート {port} で起動します。")
+    # Flaskのログを抑制するために quiet=True を追加
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+# GoogleDriveクライアント
+drive = None 
 
 # ★ここからGemini APIキー管理の変更点★
 # 利用可能なすべてのGemini APIキーをリストで取得
@@ -72,27 +99,157 @@ initialize_gemini_model()
 
 # ---------------- ↓ データ・プロファイル関連の関数 ↓ ----------------
 
+def get_gdrive_service():
+    """Google Driveサービスを認証して取得する"""
+    global drive
+    if drive:
+        return drive
+
+    # 環境変数からサービスアカウントキーを読み込み、デコード
+    creds_base64 = os.getenv('GDRIVE_CREDENTIALS_BASE64')
+    if not creds_base64:
+        print("エラー: GDRIVE_CREDENTIALS_BASE64 環境変数が設定されていません。")
+        exit()
+
+    creds_json = base64.b64decode(creds_base64).decode('utf-8')
+    
+    # PyDrive2の認証設定（サービスアカウントを使う場合）
+    gauth = GoogleAuth()
+    # JSON文字列から直接認証情報をロード
+    gauth.LoadFromString(creds_json) # PyDrive2 1.15.0+ でこのメソッドが利用可能
+    
+    # 認証タイプを設定 (サービスアカウント)
+    gauth.setting['oauth_scope'] = ['https://www.googleapis.com/auth/drive']
+    gauth.setting['client_config'] = json.loads(creds_json) # サービスアカウント認証
+    gauth.Auth()
+    
+    drive = GoogleDrive(gauth)
+    return drive
+
+def download_db_from_gdrive():
+    """Google DriveからDBファイルをダウンロードする"""
+    if not GDRIVE_FOLDER_ID:
+        print("警告: GDRIVE_FOLDER_ID が設定されていません。DBの永続化は行われません。")
+        return
+
+    drive_service = get_gdrive_service()
+    file_list = drive_service.ListFile({'q': f"'{GDRIVE_FOLDER_ID}' in parents and title='{DB_FILE}' and trashed=false"}).GetList()
+
+    if file_list:
+        file_id = file_list[0]['id']
+        file = drive_service.CreateFile({'id': file_id})
+        file.GetContentFile(DB_FILE)
+        print(f"Google Driveから {DB_FILE} をダウンロードしました。")
+    else:
+        print(f"Google Driveに {DB_FILE} が見つかりません。新規作成します。")
+        # データベースファイルを初期化
+        init_db()
+
+
+def upload_db_to_gdrive():
+    """DBファイルをGoogle Driveにアップロード（または更新）する"""
+    if not GDRIVE_FOLDER_ID:
+        print("警告: GDRIVE_FOLDER_ID が設定されていません。DBの永続化は行われません。")
+        return
+
+    drive_service = get_gdrive_service()
+    file_list = drive_service.ListFile({'q': f"'{GDRIVE_FOLDER_ID}' in parents and title='{DB_FILE}' and trashed=false"}).GetList()
+
+    if file_list:
+        # 既存のファイルを更新
+        file_id = file_list[0]['id']
+        file = drive_service.CreateFile({'id': file_id})
+        file.SetContentFile(DB_FILE)
+        file.Upload()
+        print(f"Google Drive上の {DB_FILE} を更新しました。")
+    else:
+        # 新規作成
+        file = drive_service.CreateFile({'title': DB_FILE, "parents": [{"id": GDRIVE_FOLDER_ID}]})
+        file.SetContentFile(DB_FILE)
+        file.Upload()
+        print(f"Google Driveに {DB_FILE} を新規作成しました。")
+
+def init_db():
+    """SQLiteデータベースを初期化（テーブル作成）する"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # profile_data テーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS profile_data (
+            id INTEGER PRIMARY KEY,
+            content TEXT
+        )
+    ''')
+    # takumi_log テーブル
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS takumi_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            username TEXT,
+            message_content TEXT
+        )
+    ''')
+    # profile_dataに初期プロンプトを挿入 (ファイルがない場合)
+    cursor.execute("SELECT COUNT(*) FROM profile_data")
+    if cursor.fetchone()[0] == 0:
+        initial_prompt = "あなたは拓海です。\n拓海は明るく、少し生意気な性格です。\n口癖は「マジかよ」です。\n趣味はドライブとアニメ鑑賞です。"
+        cursor.execute("INSERT INTO profile_data (id, content) VALUES (?, ?)", (1, initial_prompt))
+        print("profile_dataテーブルを初期化しました。")
+
+    conn.commit()
+    conn.close()
+
 def load_profile():
-    """プロファイルファイル (profile.txt) を読み込む"""
-    global takumi_base_prompt # 変数名をt_san_base_promptからtakumi_base_promptに変更
-    try:
-        with open(PROFILE_FILE, 'r', encoding='utf-8') as f:
-            takumi_base_prompt = f.read()
-        print(f"{PROFILE_FILE}を正常に読み込みました。")
-    except FileNotFoundError:
-        print(f"エラー: {PROFILE_FILE} が見つかりません。デフォルトのプロンプトを使用します。")
-        takumi_base_prompt = "あなたは拓海です。" # デフォルト値
-        # ファイルが存在しない場合に作成
-        with open(PROFILE_FILE, 'w', encoding='utf-8') as f:
-            f.write(takumi_base_prompt + "\n")
-            f.write("拓海は明るく、少し生意気な性格です。\n")
-            f.write("口癖は「マジかよ」です。\n")
-            f.write("趣味はドライブとアニメ鑑賞です。\n")
+    """SQLiteからプロファイルデータを読み込む"""
+    global takumi_base_prompt
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT content FROM profile_data WHERE id = 1")
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        takumi_base_prompt = result[0]
+        print(f"SQLiteからプロファイルを正常に読み込みました。")
+    else:
+        print("エラー: profile_dataテーブルにデータが見つかりません。デフォルトのプロンプトを使用します。")
+        takumi_base_prompt = "あなたは拓海です。" # フォールバック
+
+def save_profile(content):
+    """SQLiteにプロファイルデータを保存する"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE profile_data SET content = ? WHERE id = 1", (content,))
+    conn.commit()
+    conn.close()
+    print("プロファイルをSQLiteに保存しました。")
+
+def save_takumi_log(username, message_content):
+    """SQLiteに拓海さんの過去の発言履歴を保存する"""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO takumi_log (timestamp, username, message_content) VALUES (?, ?, ?)",
+        (timestamp, username, message_content)
+    )
+    conn.commit()
+    conn.close()
+
+def load_takumi_log():
+    """SQLiteから過去の発言履歴を読み込む"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # 最新50件を取得し、古い順に並べ替える
+    cursor.execute("SELECT timestamp, username, message_content FROM takumi_log ORDER BY id DESC LIMIT 50") 
+    logs = cursor.fetchall()
+    conn.close()
+    return "\n".join([f"[{row[0]}] {row[1]}: {row[2]}" for row in reversed(logs)])
 
 def load_data():
     """データファイル (data.json) とプロファイルファイルを読み込む"""
     global conversation_history, channel_settings
-    load_profile() # プロファイルを先に読み込む
+    # load_profile() は on_ready で DB から読み込まれるため、ここでは不要
     try:
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -109,19 +266,6 @@ def save_data():
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
         data = {'history': conversation_history, 'settings': channel_settings}
         json.dump(data, f, ensure_ascii=False, indent=4)
-
-# 拓海さんの過去の発言履歴を保存する関数 (takumi_log.txt用)
-def save_takumi_log(username, message_content):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(TAKUMI_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{timestamp}] {username}: {message_content}\n")
-
-# 過去の発言履歴を読み込む関数 (takumi_log.txt用)
-def load_takumi_log():
-    if not os.path.exists(TAKUMI_LOG_FILE):
-        return ""
-    with open(TAKUMI_LOG_FILE, "r", encoding="utf-8") as f:
-        return f.read()
 
 # ---------------- ↓ 新機能：会話からの学習 ↓ ----------------
 
@@ -141,9 +285,11 @@ async def learn_from_conversation(message: discord.Message):
         new_fact = response.text.strip()
 
         if new_fact.lower() != "none" and len(new_fact) > 5:
-            with open(PROFILE_FILE, 'a', encoding='utf-8') as f:
-                f.write(f"\n- {new_fact}")
-            load_profile()
+            # profile.txt を直接書き換えるのではなく、現在の内容を読み込み、新しい事実を追加して保存
+            current_profile_content = takumi_base_prompt # load_profileで読み込まれた最新のプロンプト
+            new_profile_content = current_profile_content + f"\n- {new_fact}"
+            save_profile(new_profile_content) # DBに保存
+            load_profile() # 更新されたプロファイルを再読み込みしてtakumi_base_promptを更新
             print(f"【学習成功】新しい情報を覚えました: {new_fact}")
             await message.add_reaction("🧠")
 
@@ -163,7 +309,14 @@ tree = app_commands.CommandTree(client)
 @client.event
 async def on_ready():
     """BotがDiscordに接続した際に実行されるイベント"""
-    load_data()
+    # DBファイルをGoogle Driveからダウンロード
+    download_db_from_gdrive()
+    # DBの初期化（テーブル作成、初期プロンプト挿入）
+    init_db()
+    # DBからプロファイルを読み込み (init_dbで初期データが作られる)
+    load_profile() 
+    
+    load_data() # data.jsonは今まで通り（起動時に読み込み、終了時に消える）
 
     try:
         await tree.sync()
@@ -173,6 +326,19 @@ async def on_ready():
 
     print(f'{client.user} としてログインしました')
     print('------------------------------------')
+    
+    # ここに定期アップロードタスクを開始
+    client.loop.create_task(periodic_db_upload())
+
+
+# 定期的にDBファイルをGoogle Driveにアップロードするタスク
+async def periodic_db_upload():
+    while True:
+        await asyncio.sleep(60 * 10) # 10分おきにアップロード
+        try:
+            upload_db_to_gdrive()
+        except Exception as e:
+            print(f"定期DBアップロード中にエラー: {e}")
 
 
 # --- スラッシュコマンドの定義 (nameに "taku_" を付与) ---
@@ -194,9 +360,12 @@ async def taku_toggle_mention(interaction: discord.Interaction):
 async def taku_addinfo(interaction: discord.Interaction, info: str):
     """拓海さんのプロファイル情報に新しい情報を追加します。"""
     try:
-        with open(PROFILE_FILE, 'a', encoding='utf-8') as f:
-            f.write(f"\n- {info}")
-        load_profile()
+        # with open(PROFILE_FILE, 'a', encoding='utf-8') as f: # <-- ファイル書き込みを削除
+        #     f.write(f"\n- {info}")
+        current_profile_content = takumi_base_prompt
+        new_profile_content = current_profile_content + f"\n- {info}"
+        save_profile(new_profile_content) # DBに保存
+        load_profile() # 更新されたプロファイルを再読み込み
         await interaction.response.send_message(f"拓海さんのプロファイルに「{info}」を追加しました。", ephemeral=True)
         print(f"プロファイル情報が手動で追加されました: {info}")
     except Exception as e:
@@ -206,8 +375,8 @@ async def taku_addinfo(interaction: discord.Interaction, info: str):
 @tree.command(name="taku_showinfo", description="拓海さんのプロファイル情報を表示します。")
 async def taku_showinfo(interaction: discord.Interaction):
     """拓海さんのプロファイルファイルの内容を表示します。"""
-    info = load_profile()
-    await interaction.response.send_message(f"**拓海さんのプロファイル情報:**\n```\n{info}\n```", ephemeral=True)
+    # info = load_profile() # on_readyで読み込まれているので、改めて呼び出す必要はないが、最新を保証するなら呼び出しても良い
+    await interaction.response.send_message(f"**拓海さんのプロファイル情報:**\n```\n{takumi_base_prompt}\n```", ephemeral=True)
 
 @tree.command(name="taku_get_history", description="チャンネルから指定ユーザーの過去の発言履歴を取得します。")
 @app_commands.describe(username="履歴を取得したいユーザーの名前（例: 拓海）", limit="取得するメッセージ数（最大500）")
@@ -225,13 +394,12 @@ async def taku_get_history(interaction: discord.Interaction, username: str, limi
 
     message_count = 0
     try:
-        with open(TAKUMI_LOG_FILE, "a", encoding="utf-8") as f_log:
-            async for msg in interaction.channel.history(limit=limit):
-                if msg.author == target_user:
-                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    f_log.write(f"[{timestamp}] {msg.author.display_name}: {msg.content}\n")
-                    message_count += 1
-        await interaction.followup.send(f"'{username}' さんの発言履歴を {message_count} 件取得し、`{TAKUMI_LOG_FILE}` に保存しました。", ephemeral=True)
+        # with open(TAKUMI_LOG_FILE, "a", encoding="utf-8") as f_log: # <-- ファイル書き込みを削除
+        async for msg in interaction.channel.history(limit=limit):
+            if msg.author == target_user:
+                save_takumi_log(msg.author.display_name, msg.content) # <-- DBに保存
+                message_count += 1
+        await interaction.followup.send(f"'{username}' さんの発言履歴を {message_count} 件取得し、データベースに保存しました。", ephemeral=True) # <-- メッセージを修正
         print(f"'{username}' の発言履歴が保存されました: {message_count} 件")
     except Exception as e:
         await interaction.followup.send(f"履歴取得中にエラーが発生しました: {e}", ephemeral=True)
@@ -239,11 +407,11 @@ async def taku_get_history(interaction: discord.Interaction, username: str, limi
 
 @tree.command(name="taku_showlog", description="保存された拓海さんの発言履歴ログを表示します。")
 async def taku_showlog(interaction: discord.Interaction):
-    """保存された `takumi_log.txt` の内容を表示します。"""
+    """保存されたログの内容を表示します。"""
     try:
-        log_content = load_takumi_log()
-    except FileNotFoundError:
-        await interaction.response.send_message(f"発言履歴ログファイル `{TAKUMI_LOG_FILE}` が見つかりません。", ephemeral=True)
+        log_content = load_takumi_log() # <-- DBから読み込み
+    except Exception as e: # FileNotFoundError ではなく一般的な Exception で捕捉
+        await interaction.response.send_message(f"発言履歴ログの読み込み中にエラーが発生しました: {e}", ephemeral=True)
         return
 
     if not log_content:
@@ -299,7 +467,7 @@ async def on_message(message):
                 elif turn['role'] == "拓海": # ロール名を「拓海」に統一
                     gemini_history_for_prompt.append({"role": "model", "parts": [turn['content']]})
 
-            current_takumi_log = load_takumi_log()
+            current_takumi_log = load_takumi_log() # <-- DBから読み込み
 
             # Geminiに渡すシステム命令とコンテンツを構築
             full_system_instruction = f"""
@@ -419,9 +587,14 @@ def history_prompt_for_display(history): # 新しいヘルパー関数
     return display_str
 
 
-keep_alive() # keep_alive.py で定義された関数を呼び出す
+# Flaskアプリを別スレッドで開始
+import threading
+flask_thread = threading.Thread(target=run_flask_app)
+flask_thread.daemon = True # メインプロセス終了時にスレッドも終了
+flask_thread.start()
+
 try:
     token = os.environ['DISCORD_BOT_TOKEN']
     client.run(token)
 except KeyError:
-    print("エラー: DISCORD_BOT_TOKENが設定されていません。ReplitのSecretsを確認してください。")
+    print("エラー: DISCORD_BOT_TOKENが設定されていません。Koyebの環境変数を確認してください。") # <-- メッセージを修正
