@@ -11,7 +11,7 @@ import sqlite3
 import base64
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
-from io import BytesIO
+from io import BytesIO # インメモリファイル操作用
 
 # ---------------- ↓ 変数と基本設定 ↓ ----------------
 
@@ -108,18 +108,21 @@ def get_gdrive_service():
     creds_base64 = os.getenv('GDRIVE_CREDENTIALS_BASE64')
     if not creds_base64:
         print("エラー: GDRIVE_CREDENTIALS_BASE64 環境変数が設定されていません。")
-        # 環境変数がなければ認証を試みず、Noneを返す
         return None 
 
     try:
-        creds_json = base64.b64decode(creds_base64).decode('utf-8')
+        creds_json_str = base64.b64decode(creds_base64).decode('utf-8')
         
+        # PyDrive2でサービスアカウント認証を行うための設定
         gauth = GoogleAuth()
-        gauth.LoadFromString(creds_json)
+        # サービスアカウントキーのJSON文字列をファイルのように扱う
+        # PyDrive2のServiceAuthはファイルパスを期待するため、BytesIOで模擬する
+        gauth.settings['client_config'] = json.loads(creds_json_str)
+        gauth.settings['oauth_scope'] = ['https://www.googleapis.com/auth/drive']
         
-        gauth.setting['oauth_scope'] = ['https://www.googleapis.com/auth/drive']
-        gauth.setting['client_config'] = json.loads(creds_json)
-        gauth.Auth()
+        # サービスアカウント認証を実行
+        # PyDrive2 1.15.0以降では ServiceAuth() が推奨される
+        gauth.ServiceAuth() 
         
         drive = GoogleDrive(gauth)
         return drive
@@ -131,7 +134,7 @@ def download_db_from_gdrive():
     """Google DriveからDBファイルをダウンロードする"""
     if not GDRIVE_FOLDER_ID:
         print("警告: GDRIVE_FOLDER_ID が設定されていません。DBの永続化は行われません。")
-        return False # 失敗を示す
+        return False 
     
     drive_service = get_gdrive_service()
     if not drive_service: # 認証に失敗した場合
