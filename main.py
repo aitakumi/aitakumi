@@ -12,6 +12,7 @@ import base64
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 from io import BytesIO # インメモリファイル操作用
+import tempfile
 
 # ---------------- ↓ 変数と基本設定 ↓ ----------------
 
@@ -104,31 +105,37 @@ def get_gdrive_service():
     if drive:
         return drive
 
-    # 環境変数からサービスアカウントキーを読み込み、デコード
-    creds_base64 = os.getenv('GDRIVE_CREDENTIALS_BASE64')
-    if not creds_base64:
+    creds_base66 = os.getenv('GDRIVE_CREDENTIALS_BASE64') # 変数名を creds_base66 に変更
+    if not creds_base66:
         print("エラー: GDRIVE_CREDENTIALS_BASE64 環境変数が設定されていません。")
         return None 
 
     try:
-        creds_json_str = base64.b64decode(creds_base64).decode('utf-8')
+        creds_json_str = base64.b64decode(creds_base66).decode('utf-8')
         
-        # PyDrive2でサービスアカウント認証を行うための設定
-        gauth = GoogleAuth()
-        # サービスアカウントキーのJSON文字列をファイルのように扱う
-        # PyDrive2のServiceAuthはファイルパスを期待するため、BytesIOで模擬する
-        gauth.settings['client_config'] = json.loads(creds_json_str)
-        gauth.settings['oauth_scope'] = ['https://www.googleapis.com/auth/drive']
-        
-        # サービスアカウント認証を実行
-        # PyDrive2 1.15.0以降では ServiceAuth() が推奨される
-        gauth.ServiceAuth() 
-        
-        drive = GoogleDrive(gauth)
-        return drive
+        # 一時ファイルにサービスアカウントキーを書き出す
+        # withブロックを使うことで、自動的にファイルがクリーンアップされる
+        with tempfile.NamedTemporaryFile(mode='w', delete=True, encoding='utf-8') as temp_key_file:
+            temp_key_file.write(creds_json_str)
+            temp_key_file.flush() # バッファをフラッシュしてファイルに書き込む
+
+            gauth = GoogleAuth()
+            # client_secrets_file に一時ファイルのパスを渡す
+            gauth.settings['client_secrets_file'] = temp_key_file.name
+            gauth.settings['oauth_scope'] = ['https://www.googleapis.com/auth/drive']
+            
+            # サービスアカウント認証を実行
+            gauth.ServiceAuth() 
+            
+            drive = GoogleDrive(gauth)
+            return drive
     except Exception as e:
         print(f"Google Drive認証エラー: {e}")
+        # 詳細なエラー情報を出力
+        import traceback
+        traceback.print_exc()
         return None
+
 
 def download_db_from_gdrive():
     """Google DriveからDBファイルをダウンロードする"""
