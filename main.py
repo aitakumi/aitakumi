@@ -75,7 +75,7 @@ def initialize_gemini_model():
             current_key = GEMINI_API_KEYS[current_api_key_index]
             genai.configure(api_key=current_key)
             model = genai.GenerativeModel(
-                'gemini-1.5-flash-latest', # 使用するGeminiモデル
+                'gemini-2.5-flash', # 使用するGeminiモデル
                 safety_settings=[ # 不適切なコンテンツ生成を抑制
                     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -637,7 +637,7 @@ def switch_gemini_api_key():
         genai.configure(api_key=current_key)
         # 新しいAPIキーでモデルを再初期化
         model = genai.GenerativeModel(
-            'gemini-1.5-flash-latest',
+            'gemini-2.5-flash',
             safety_settings=[
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
